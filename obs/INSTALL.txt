@@ -1,0 +1,20 @@
+Paintify for OBS (Windows, OBS Studio 31.1.x)
+
+Download paintify-obs-windows.zip from:
+https://github.com/BrownBearr/paintify-obs/releases/latest
+
+1. Extract the paintify-obs folder from the zip into:
+   %PROGRAMDATA%\obs-studio\plugins\
+   Windows may ask for administrator permission.
+   Check that paintify-obs\bin\64bit\paintify-obs.dll is present there.
+2. Restart OBS Studio and use its Direct3D 11 graphics backend. A GPU
+   supporting OpenGL 4.6 is required.
+3. Right-click a source, open Filters, and add "Paintify GPU" under
+   Effect Filters. Wait a moment for the first painted frame.
+
+The filter starts its bundled GPU renderer automatically. It passes through
+the original source if the renderer is unavailable. The source output is
+opaque because Paintify paints an underpainted canvas.
+
+See README.md in this folder for source and build instructions. The OBS
+plugin is GPL-2.0-or-later; see licenses/Paintify-OBS-GPL-2.0.txt.

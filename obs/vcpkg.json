@@ -1,0 +1,8 @@
+{
+  "name": "paintify-obs-plugin",
+  "version": "0.1.0",
+  "builtin-baseline": "cc73782a88db48af17f8bfb8328d4cab3d4c246f",
+  "dependencies": [
+    { "name": "spout2", "features": ["dx"], "platform": "windows" }
+  ]
+}
