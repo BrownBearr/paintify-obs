@@ -1,0 +1,155 @@
+#version 460 core
+layout(local_size_x = 64) in;
+
+#include "common.glsl"
+
+// One thread per seed. A line-for-line port of worker.js `makeCurvedStroke`,
+// including the two termination rules the first version of this renderer was
+// missing: the canvas-vs-reference test (stop once the canvas is already
+// closer to the reference than this stroke's own colour would be) and the
+// gradient-magnitude floor. The old edge-threshold break is gone -- Hertzmann
+// strokes cross edges, they do not stop at them.
+
+layout(binding = 0) uniform sampler2D uRef;      // per-layer reference blur
+layout(binding = 1) uniform sampler2D uCanvas;   // canvas at chunk start
+layout(binding = 2) uniform sampler2D uGrad;     // (gx, gy, gmag, -)
+
+layout(std430, binding = 1) restrict readonly buffer SeedBuf    { Seed seeds[]; };
+layout(std430, binding = 2) restrict writeonly buffer VertexBuf { PackedVertex verts[]; };
+// drawnCount / pointCount exist so the overlay can report what worker.js
+// reports: a stroke that traced to a single point draws nothing, and seeds
+// outnumber drawn strokes heavily in flat regions where the gradient floor
+// stops the walk at the first step.
+layout(std430, binding = 3) restrict buffer CounterBuf {
+    uint seedCount; uint traceCount; uint drawnCount; uint pointCount;
+};
+layout(std430, binding = 4) restrict writeonly buffer HeaderBuf { StrokeHeader headers[]; };
+layout(std430, binding = 5) restrict writeonly buffer IndirectBuf {
+    uint cmdCount; uint cmdInstanceCount; uint cmdFirst; uint cmdBaseInstance;
+};
+layout(std430, binding = 8) restrict buffer PoolCounterBuf { PoolCounters pool; };
+
+void storeVertex(uint slot, vec2 pos, float radius, float arc) {
+    verts[slot] = uvec2(packHalf2x16(pos), packHalf2x16(vec2(radius, arc)));
+}
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint budget = min(uint(SEED_BUDGET), uint(seeds.length()));
+    uint n = min(seedCount, budget);
+
+    // One thread fills the draw command, so stage 4 never needs a readback.
+    // The ribbon is one triangle strip instance per stroke: two vertices per
+    // polyline point, and instancing restarts the strip for each stroke.
+    if (gid == 0u) {
+        cmdCount = MAX_VERTS * 2u;
+        cmdInstanceCount = n;
+        cmdFirst = 0u;
+        cmdBaseInstance = 0u;
+        traceCount = n;
+        // Reserve this pass' slots in the frame-wide pool while we are the
+        // only thread that knows n. pool.comp then copies into base + gid
+        // without needing a second dispatch or a readback.
+        pool.base = atomicAdd(pool.count, n);
+    }
+    if (gid >= n) return;
+
+    Seed s = seeds[gid];
+    ivec2 size = ivec2(IMG_SIZE);
+    int maxLen = clamp(int(MAX_STROKE_LEN), 1, int(MAX_VERTS) - 1);
+    int minLen = max(int(MIN_STROKE_LEN), 1);
+    float curv = clamp(CURVATURE, 0.0, 1.0);
+
+    // worker.js: `step = Math.max(1, Math.round(radius))`.
+    float stepLen = max(1.0, floor(s.radius + 0.5));
+
+    // The termination test compares against the *unjittered* reference colour
+    // at the seed, so re-sample it here rather than using the seed's stored
+    // colour, which has already been through the HSV jitter.
+    ivec2 sp = clamp(ivec2(floor(s.pos)), ivec2(0), size - 1);
+    vec3 strokeRef = texelFetch(uRef, sp, 0).rgb;
+
+    uint base = gid * MAX_VERTS;
+    vec2 p = s.pos;
+    vec2 last = s.dir;          // (0,0) on a fresh seed
+    float arc = 0.0;
+    storeVertex(base, p, s.radius, arc);
+    uint count = 1u;
+
+    // Hash the stroke's position, not its index: gid is a compaction order
+    // that shifts when neighbouring cells pass or fail the threshold, so an
+    // index-based hash would re-roll the angle jitter of a stroke that had not
+    // moved at all.
+    uint hseed = hashU(uint(sp.x) * 73856093u ^ uint(sp.y) * 19349663u
+                       ^ frameSalt() * 9781u);
+    float angleJitterRad = radians(ANGLE_JITTER);
+
+    for (int iter = 1; iter <= maxLen; ++iter) {
+        ivec2 ip = ivec2(floor(p));
+        if (ip.x < 0 || ip.y < 0 || ip.x >= size.x || ip.y >= size.y) break;
+
+        // Stop when the canvas already matches the reference here better than
+        // this stroke's colour does. Without this every stroke runs to its
+        // full length, which is what made the old output read as hair.
+        if (iter >= minLen) {
+            vec3 r = texelFetch(uRef, ip, 0).rgb;
+            vec3 c = texelFetch(uCanvas, ip, 0).rgb;
+            float dCan = dot(abs(r - c), vec3(1.0));
+            float dStr = dot(abs(r - strokeRef), vec3(1.0));
+            if (dCan <= dStr) break;
+        }
+
+        vec3 grad = texelFetch(uGrad, ip, 0).rgb;
+        if (grad.z * stepLen < 1e-3) break;
+
+        // Tangent = gradient rotated 90 degrees.
+        vec2 nd = vec2(-grad.y, grad.x);
+        if (dot(last, nd) < 0.0) nd = -nd;
+
+        // On the first step there is no previous direction. worker.js leaves
+        // `last` at (0,0) here, which makes the fc filter below collapse to
+        // zero at curvature == 0 and abort the stroke after a single point --
+        // so the web's own `pointillist` preset (curvature 0) paints nothing
+        // but the underpaint. Seeding `last` from the gradient instead is
+        // bit-identical for every curvature > 0, because the blend then
+        // reduces to the gradient direction either way, and it turns
+        // curvature 0 into the straight strokes the preset is asking for.
+        if (dot(last, last) < 1e-12) last = normalize(nd);
+
+        // Hertzmann's fc filter. `last` is unit length while `nd` carries the
+        // raw gradient magnitude, exactly as in the web version -- at
+        // curvature < 1 that weighting is part of the curve's shape.
+        nd = curv * nd + (1.0 - curv) * last;
+        float nm = length(nd);
+        if (nm < 1e-6) break;
+        nd /= nm;
+
+        if (angleJitterRad > 0.0) {
+            float th = (hash01(hseed ^ uint(iter) * 2654435761u) * 2.0 - 1.0) * angleJitterRad;
+            float cs = cos(th), sn = sin(th);
+            nd = vec2(nd.x * cs - nd.y * sn, nd.x * sn + nd.y * cs);
+        }
+
+        vec2 np = p + stepLen * nd;
+        last = nd;
+        if (np.x < 0.0 || np.y < 0.0 || np.x >= IMG_SIZE.x || np.y >= IMG_SIZE.y) break;
+
+        arc += distance(np, p);
+        p = np;
+        storeVertex(base + count, p, s.radius, arc);
+        ++count;
+        if (count >= MAX_VERTS) break;
+    }
+
+    if (count >= 2u) {
+        atomicAdd(drawnCount, 1u);
+        atomicAdd(pointCount, count);
+    }
+
+    StrokeHeader h;
+    h.vertexCount = count;
+    h.layerTex = s.layerTex;
+    h.color = s.color;          // .a is the per-stroke opacity
+    h.totalLen = max(arc, 1e-6);
+    headers[gid] = h;
+}

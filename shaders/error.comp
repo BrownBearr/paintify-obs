@@ -1,0 +1,82 @@
+#version 460 core
+
+#include "common.glsl"
+
+// Hertzmann's placement test, which the first version of this renderer did not
+// have at all. Pass 0 builds the per-pixel Lab error between the layer's
+// reference blur and the canvas as it stands *before* this layer paints; pass 1
+// reduces it over each seed-grid cell into (mean error, argmax position).
+//
+// worker.js computes `err` once per layer and then lets the cell loop mutate
+// the canvas underneath it, so the error map is deliberately layer-synchronous
+// there too -- this is not an approximation introduced by going parallel.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform sampler2D uRef;      // per-layer Gaussian reference
+layout(binding = 1) uniform sampler2D uCanvas;   // canvas so far
+layout(binding = 2) uniform sampler2D uError;    // pass 1 input
+layout(binding = 3) uniform sampler2D uDiff;     // pass 1, temporal only
+
+layout(r16f, binding = 0) uniform writeonly image2D uErrOut;
+
+// One record per seed-grid cell. `best` packs the argmax pixel as x | (y << 16),
+// which caps usable image size at 65535 per axis -- far past anything the
+// rasterizer will keep up with.
+struct Cell { float meanErr; uint best; float maxDiff; float pad; };
+layout(std430, binding = 0) restrict buffer CellBuf { Cell cells[]; };
+
+uniform int uPass;
+uniform int uTemporal;
+
+void pass0(ivec2 px) {
+    vec3 ref = texelFetch(uRef, px, 0).rgb;
+    vec3 can = texelFetch(uCanvas, px, 0).rgb;
+    vec3 d = rgb2labCV(clamp(ref, 0.0, 1.0)) - rgb2labCV(clamp(can, 0.0, 1.0));
+    imageStore(uErrOut, px, vec4(length(d), 0.0, 0.0, 0.0));
+}
+
+// One invocation per cell. The cell is at most GRID_SPACING px on a side, and
+// GRID_SPACING is radius * gridFactor, so the coarse layers reduce big cells
+// and the fine layers reduce 2x2 ones -- the loop bound has to stay dynamic.
+void pass1(ivec2 cell) {
+    ivec2 size = ivec2(IMG_SIZE);
+    int grid = max(1, int(GRID_SPACING));
+    ivec2 c0 = cell * grid;
+    ivec2 c1 = min(c0 + grid, size);
+    if (c0.x >= size.x || c0.y >= size.y) return;
+
+    float sum = 0.0, best = -1.0, maxDiff = 0.0;
+    int count = 0;
+    ivec2 bestPx = c0;
+    for (int y = c0.y; y < c1.y; ++y) {
+        for (int x = c0.x; x < c1.x; ++x) {
+            float e = texelFetch(uError, ivec2(x, y), 0).r;
+            sum += e; ++count;
+            // worker.js breaks ties with a 1e-3 random nudge so flat cells do
+            // not all seed at their top-left corner; a hash of the pixel gives
+            // the same scatter without a per-thread RNG.
+            float j = e + hash01(uint(x * 73856093 ^ y * 19349663)) * 1e-3;
+            if (j > best) { best = j; bestPx = ivec2(x, y); }
+            // worker.js takes the *max* source difference over the cell, not
+            // the mean: one moving edge inside a cell must repaint the cell.
+            if (uTemporal != 0) maxDiff = max(maxDiff, texelFetch(uDiff, ivec2(x, y), 0).r);
+        }
+    }
+
+    uint gridW = uint((size.x + grid - 1) / grid);
+    uint idx = uint(cell.y) * gridW + uint(cell.x);
+    if (idx >= cells.length()) return;
+    cells[idx].meanErr = (count > 0) ? sum / float(count) : 0.0;
+    cells[idx].best = uint(bestPx.x) | (uint(bestPx.y) << 16);
+    cells[idx].maxDiff = maxDiff;
+}
+
+void main() {
+    ivec2 id = ivec2(gl_GlobalInvocationID.xy);
+    if (uPass == 0) {
+        if (id.x < int(IMG_SIZE.x) && id.y < int(IMG_SIZE.y)) pass0(id);
+    } else {
+        pass1(id);
+    }
+}

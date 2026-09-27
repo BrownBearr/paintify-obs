@@ -1,0 +1,58 @@
+#version 460 core
+layout(local_size_x = 64) in;
+
+#include "common.glsl"
+
+// The frame-wide stroke pool. The greedy phase paints a layer in several
+// passes and each pass reuses the same stroke buffers, so by the end of a
+// frame nothing remembers the strokes any more -- fine for plain painting,
+// useless for relaxation, which has to revisit every stroke it already placed.
+//
+// Pass 0 appends a finished pass' strokes (header plus polyline) to the pool.
+// Pass 1 writes the indirect draw command for the whole pool, so the canvas can
+// be repainted from the pool alone after relaxation has moved things.
+
+layout(std430, binding = 2) restrict readonly buffer VertexBuf { PackedVertex verts[]; };
+layout(std430, binding = 4) restrict readonly buffer HeaderBuf { StrokeHeader headers[]; };
+layout(std430, binding = 3) restrict readonly buffer CounterBuf {
+    uint seedCount; uint traceCount; uint drawnCount; uint pointCount;
+};
+layout(std430, binding = 5) restrict writeonly buffer IndirectBuf {
+    uint cmdCount; uint cmdInstanceCount; uint cmdFirst; uint cmdBaseInstance;
+};
+layout(std430, binding = 6) restrict buffer PoolVertexBuf { PackedVertex poolVerts[]; };
+layout(std430, binding = 7) restrict buffer PoolHeaderBuf { StrokeHeader poolHeaders[]; };
+layout(std430, binding = 8) restrict buffer PoolCounterBuf { PoolCounters pool; };
+
+uniform int uPass;
+uniform uint uPoolCapacity;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+
+    if (uPass == 1) {
+        if (gid != 0u) return;
+        cmdCount = MAX_VERTS * 2u;
+        cmdInstanceCount = min(pool.count, uPoolCapacity);
+        cmdFirst = 0u;
+        cmdBaseInstance = 0u;
+        return;
+    }
+
+    // trace.comp reserved this pass' slot range in pool.base, so every thread
+    // here knows where to write without a second dispatch or a readback.
+    uint n = min(traceCount, uint(SEED_BUDGET));
+    if (gid >= n) return;
+
+    uint dst = pool.base + gid;
+    if (dst >= uPoolCapacity) return;     // pool full; the pass still painted
+
+    StrokeHeader h = headers[gid];
+    poolHeaders[dst] = h;
+
+    // Only the points the stroke actually has. The rest of the slot is never
+    // read, because stroke.vert clamps to vertexCount.
+    uint vc = min(h.vertexCount, MAX_VERTS);
+    for (uint k = 0u; k < vc; ++k)
+        poolVerts[dst * MAX_VERTS + k] = verts[gid * MAX_VERTS + k];
+}

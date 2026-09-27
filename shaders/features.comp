@@ -1,0 +1,70 @@
+#version 460 core
+layout(local_size_x = 16, local_size_y = 16) in;
+
+#include "common.glsl"
+
+// Port of worker.js `computeGradients` / `computeGradientsST`, run once per
+// layer on that layer's reference blur.
+//
+// Running it per layer is the second big fix over the first version, which
+// computed one gradient field from the full-resolution source and reused it for
+// every layer. A radius-8 stroke then chased pixel-level tangents for 16 steps,
+// which is what produced the wiry look instead of broad marks.
+//
+// Output: (gx, gy, gmag, 0). The plain path stores the *raw* Sobel sums on
+// purpose -- makeCurvedStroke blends `curv * gradientPerp + (1-curv) * lastDir`
+// against a unit lastDir, so at curvature < 1 the gradient's magnitude carries
+// real weight. Normalising here would silently change the curve shape.
+
+layout(binding = 0) uniform sampler2D uRef;     // reference blur, linear 0..1
+layout(binding = 1) uniform sampler2D uTensor;  // pass 1/2 input
+layout(rgba16f, binding = 0) uniform writeonly image2D uOut;
+
+uniform int uPass;   // 0 = Sobel, 1 = tensor components, 2 = smoothed eigenvector
+
+// Web feeds `computeGradients` RGB in 0..255 and divides the grayscale by 255;
+// our textures are already 0..1, so grayNTSC() folds both steps together.
+float g(ivec2 p, ivec2 size) {
+    return dot(texelFetch(uRef, clamp(p, ivec2(0), size - 1), 0).rgb,
+               vec3(0.299, 0.587, 0.114));
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = ivec2(IMG_SIZE);
+    if (px.x >= size.x || px.y >= size.y) return;
+
+    if (uPass == 0 || uPass == 1) {
+        float tl = g(px + ivec2(-1, -1), size), tc = g(px + ivec2(0, -1), size);
+        float tr = g(px + ivec2( 1, -1), size), ml = g(px + ivec2(-1, 0), size);
+        float mr = g(px + ivec2( 1,  0), size), bl = g(px + ivec2(-1, 1), size);
+        float bc = g(px + ivec2( 0,  1), size), br = g(px + ivec2( 1, 1), size);
+
+        float gx = -tl + tr - 2.0 * ml + 2.0 * mr - bl + br;
+        float gy = -tl - 2.0 * tc - tr + bl + 2.0 * bc + br;
+
+        if (uPass == 0) {
+            imageStore(uOut, px, vec4(gx, gy, sqrt(gx * gx + gy * gy), 0.0));
+        } else {
+            // Tensor components, to be Gaussian-smoothed by blur.comp exactly
+            // as the web packs them into an RGB buffer and reuses its blur.
+            imageStore(uOut, px, vec4(gx * gx, gx * gy, gy * gy, 1.0));
+        }
+        return;
+    }
+
+    // uPass == 2: dominant eigenvector of the smoothed tensor. Unit length
+    // here, matching computeGradientsST, which normalises before returning.
+    vec3 J = texelFetch(uTensor, px, 0).rgb;
+    float sxx = J.x, sxy = J.y, syy = J.z;
+    float tr2 = sxx + syy;
+    float det = sxx * syy - sxy * sxy;
+    float disc = sqrt(max(0.0, tr2 * tr2 * 0.25 - det));
+    float lam1 = tr2 * 0.5 + disc;
+
+    vec2 e = vec2(sxy, lam1 - sxx);
+    float em = length(e);
+    e = (em > 1e-8) ? e / em : vec2(1.0, 0.0);
+
+    imageStore(uOut, px, vec4(e, sqrt(max(lam1, 0.0)), 0.0));
+}

@@ -1,0 +1,311 @@
+#version 460 core
+layout(local_size_x = 64) in;
+
+#include "common.glsl"
+
+// Hertzmann 2001, "Paint By Relaxation". The greedy 1998 algorithm places each
+// stroke once and never revisits it; relaxation instead treats the painting as
+// an energy minimisation and improves the strokes it already has.
+//
+//   E = E_app + E_area
+//   E_app  = sum over pixels of || Lab(canvas) - Lab(source) ||
+//   E_area = w_area * sum over strokes of area(stroke)
+//
+// E_area is what makes the result economical rather than merely accurate: a
+// stroke has to earn its coverage, so flat regions end up with a few long
+// strokes instead of many short ones.
+//
+// The relaxation operations here are the paper's: move a control point, move
+// the whole stroke, rotate it, change its length, change its width, recolour
+// it. The paper perturbs the *control points of existing strokes* -- it does
+// not re-run the greedy tracer -- which is why this kernel needs no gradient
+// field and no per-layer reference image.
+//
+// WHERE THIS DIVERGES FROM THE PAPER: the paper evaluates each trial move by
+// its effect on the *global* energy, which means re-rendering to find out how
+// a move interacts with the strokes painted over it. That is inherently
+// serial. Here each stroke is scored on its own footprint.
+//
+// Localising the energy has one trap worth spelling out, because the obvious
+// formulation is degenerate. Scoring a candidate as
+//
+//     E = area * meanFitError + w_area * area
+//
+// makes *both* terms proportional to area, so w_area only adds a constant to
+// the error and shrinking is free -- which is what the first version of this
+// kernel did, and why its area weight measurably did nothing at all. What the
+// global energy has and that version lacked is the cost of the pixels a
+// shrinking stroke stops covering: globally E_app sums over *all* pixels, so
+// uncovering some does not drop them from the sum, it hands them back to the
+// paint underneath.
+//
+// Charging for that gives, with A the candidate's area, A0 the current area,
+// Em the candidate's mean fit error and Eg the mean error of the paint
+// underneath the stroke:
+//
+//     E = A * Em + w_area * A + (A0 - A) * Eg
+//       = A * (Em + w_area - Eg) + A0 * Eg
+//
+// The last term is constant per stroke, so ranking candidates only needs
+//
+//     score = A * (Em + w_area - Eg)
+//
+// which behaves the way the paper's energy does. A stroke that fits its
+// footprint better than the paint underneath (Em + w_area < Eg) lowers the
+// score by growing; one that fits worse lowers it by shrinking; and w_area
+// moves that break-even point, which is what makes it a usable control over
+// how economical the painting is.
+//
+// WHAT "UNDERNEATH" MEANS, and getting this wrong breaks the whole thing: Eg
+// is measured against the frame's *ground* -- the underpaint the canvas
+// started from -- not against the current canvas. Measuring it on the current
+// canvas seems natural and is badly circular: that canvas already contains
+// this stroke, so it reports "the paint here is fine" precisely because the
+// stroke put it there, and every stroke in the painting looks redundant. With
+// that version, removal deleted 94% of the strokes and E_app rose from 14.9 to
+// 47.5 on a blank canvas -- it was removing exactly the strokes doing the work.
+//
+// The ground is exact for the first layer and pessimistic for later ones,
+// since it ignores intermediate layers; that errs toward keeping strokes,
+// which is the safe direction. It also means the underpaint mode is part of the
+// economics: with `--underpaint blur` the ground is already a good fit to the
+// source, so strokes are worth less and relaxation trims harder, while a blank
+// or flat ground makes coverage valuable and strokes grow. The paper starts
+// from a blank canvas.
+//
+// energy.comp reports E_app per iteration so the approximation stays checkable
+// rather than assumed. Note that E_app alone is only expected to fall
+// monotonically when w_area is 0: with a positive area weight relaxation is
+// deliberately trading appearance for economy, so E_app rises while the real
+// objective E_app + w_area * sum(area) still falls. The host prints both.
+// See docs/relaxation.md.
+
+layout(binding = 0) uniform sampler2D uSrc;      // the target image, I
+layout(binding = 1) uniform sampler2D uGround;   // the underpaint, not the canvas
+
+layout(std430, binding = 6) restrict buffer PoolVertexBuf { PackedVertex poolVerts[]; };
+layout(std430, binding = 7) restrict buffer PoolHeaderBuf { StrokeHeader poolHeaders[]; };
+layout(std430, binding = 8) restrict buffer PoolCounterBuf { PoolCounters pool; };
+
+uniform uint uPoolCapacity;
+uniform uint uSubPass;      // strokes are relaxed in hash-scattered subsets
+uniform uint uSubPassCount;
+
+// Sampling budget along and across a stroke. Enough to rank candidates without
+// letting the search cost scale with stroke length.
+const int SAMPLE_ROWS = 8;
+const int SAMPLE_COLS = 3;
+
+struct Stroke {
+    vec2  p[MAX_VERTS];
+    float radius;
+    uint  count;
+};
+
+struct Probe {
+    float em;     // mean fit error for the colour probed
+    float eg;     // mean error of the ground under the stroke
+    float area;   // swept capsule area, px
+    vec3  mean;   // coverage-weighted mean of the source under the stroke
+};
+
+// --- energy ---------------------------------------------------------------
+Probe probe(in Stroke s, vec3 col) {
+    vec2 size = IMG_SIZE;
+    float e = 0.0, eg = 0.0, wsum = 0.0;
+    vec3 acc = vec3(0.0);
+    vec3 labCol = rgb2labCV(col);
+
+    uint segs = max(s.count - 1u, 1u);
+    for (int r = 0; r < SAMPLE_ROWS; ++r) {
+        // Equal parameter steps, so the sample count never depends on length.
+        float t = (float(r) + 0.5) / float(SAMPLE_ROWS) * float(segs);
+        uint i = min(uint(t), segs - 1u);
+        vec2 a = s.p[i], b = s.p[min(i + 1u, s.count - 1u)];
+        vec2 c = mix(a, b, t - float(i));
+
+        vec2 tang = b - a;
+        float tl = length(tang);
+        vec2 nrm = (tl > 1e-5) ? vec2(-tang.y, tang.x) / tl : vec2(0.0, 1.0);
+
+        for (int q = 0; q < SAMPLE_COLS; ++q) {
+            float u = (float(q) + 0.5) / float(SAMPLE_COLS) * 2.0 - 1.0;   // -1..1
+            vec2 sp = c + nrm * (u * s.radius);
+            if (any(lessThan(sp, vec2(0.0))) || any(greaterThanEqual(sp, size))) continue;
+
+            // Triangular across-width weight: a stroke's own coverage falls off
+            // at its edges, so its edges carry less of the fit.
+            float cov = 1.0 - 0.5 * abs(u);
+            ivec2 ip = ivec2(sp);
+            vec3 I = texelFetch(uSrc, ip, 0).rgb;
+            vec3 labI = rgb2labCV(I);
+            e   += cov * distance(labCol, labI);
+            eg  += cov * distance(rgb2labCV(texelFetch(uGround, ip, 0).rgb), labI);
+            acc += cov * I;
+            wsum += cov;
+        }
+    }
+
+    Probe pr;
+    pr.mean = (wsum > 1e-6) ? acc / wsum : col;
+    pr.em   = (wsum > 1e-6) ? e / wsum : 0.0;
+    pr.eg   = (wsum > 1e-6) ? eg / wsum : 0.0;
+
+    float len = 0.0;
+    for (uint k = 1u; k < s.count; ++k) len += distance(s.p[k], s.p[k - 1u]);
+    pr.area = 2.0 * s.radius * len + 3.14159265 * s.radius * s.radius;
+    return pr;
+}
+
+// score = A * (Em + w_area - Eg); see the derivation above. `eg` is a property
+// of the footprint, not of the candidate, so it is passed in fixed.
+float score(float em, float area, float eg) {
+    return area * (em + RELAX_AREA_W - eg);
+}
+
+// --- moves ----------------------------------------------------------------
+// One perturbation, picked by hash. `amp` shrinks with the iteration count so
+// early passes explore and later ones settle.
+void perturb(inout Stroke s, uint h, float amp) {
+    uint kind = hashU(h) % 5u;
+    float r = max(s.radius, 0.5);
+
+    if (kind == 0u) {
+        // Move one control point, preferring the interior.
+        uint i = (s.count > 2u) ? 1u + hashU(h ^ 0x51u) % (s.count - 1u)
+                                : s.count - 1u;
+        i = min(i, s.count - 1u);
+        s.p[i] += (hash2(h ^ 0x62u) * 2.0 - 1.0) * r * amp;
+    } else if (kind == 1u) {
+        // Translate the whole stroke.
+        vec2 d = (hash2(h ^ 0x73u) * 2.0 - 1.0) * r * amp;
+        for (uint k = 0u; k < s.count; ++k) s.p[k] += d;
+    } else if (kind == 2u) {
+        // Shorten by dropping the tail. Lengthening is left to the greedy add
+        // pass: extrapolating past a stroke's traced end walks it off the
+        // feature it was following.
+        if (s.count > 2u) s.count -= 1u;
+    } else if (kind == 3u) {
+        // Change width. The area term makes this a real trade, not a free win.
+        s.radius = clamp(s.radius * (1.0 + (hash01(h ^ 0x84u) * 2.0 - 1.0) * 0.35 * amp),
+                         0.6, 64.0);
+    } else {
+        // Rotate about the midpoint.
+        vec2 mid = vec2(0.0);
+        for (uint k = 0u; k < s.count; ++k) mid += s.p[k];
+        mid /= float(s.count);
+        float th = (hash01(h ^ 0x95u) * 2.0 - 1.0) * 0.5 * amp;
+        float cs = cos(th), sn = sin(th);
+        for (uint k = 0u; k < s.count; ++k) {
+            vec2 d = s.p[k] - mid;
+            s.p[k] = mid + vec2(d.x * cs - d.y * sn, d.x * sn + d.y * cs);
+        }
+    }
+}
+
+void store(uint idx, in Stroke s, vec3 col, float opacity) {
+    float arc = 0.0;
+    for (uint k = 0u; k < s.count; ++k) {
+        if (k > 0u) arc += distance(s.p[k], s.p[k - 1u]);
+        poolVerts[idx * MAX_VERTS + k] =
+            uvec2(packHalf2x16(s.p[k]), packHalf2x16(vec2(s.radius, arc)));
+    }
+    StrokeHeader h = poolHeaders[idx];
+    h.vertexCount = s.count;
+    h.color = packUnorm4x8(vec4(col, opacity));
+    h.totalLen = max(arc, 1e-6);
+    poolHeaders[idx] = h;
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    uint n = min(pool.count, uPoolCapacity);
+    if (idx >= n) return;
+
+    // Overlapping strokes must not be perturbed in the same dispatch, or each
+    // scores against a canvas the other is changing. Hash-scattered subsets
+    // keep concurrently-relaxed strokes spread across the image, the same
+    // trick the painting passes use.
+    if (uSubPassCount > 1u &&
+        (hashU(idx * 2246822519u) % uSubPassCount) != uSubPass) return;
+
+    StrokeHeader hdr = poolHeaders[idx];
+    if (hdr.vertexCount < 2u) return;       // already removed, or never drawn
+
+    Stroke cur;
+    cur.count = min(hdr.vertexCount, MAX_VERTS);
+    for (uint k = 0u; k < cur.count; ++k)
+        cur.p[k] = unpackHalf2x16(poolVerts[idx * MAX_VERTS + k].x);
+    cur.radius = unpackHalf2x16(poolVerts[idx * MAX_VERTS].y).x;
+
+    vec4 col4 = unpackUnorm4x8(hdr.color);
+    float opacity = col4.a;
+
+    // Eg belongs to the footprint, not to any candidate, so measure it once
+    // and hold it fixed for every comparison in this iteration.
+    Probe base = probe(cur, col4.rgb);
+    const float eg = base.eg;
+
+    Stroke best = cur;
+    vec3 bestCol = col4.rgb;
+    float bestS = score(base.em, base.area, eg);
+    float bestEm = base.em;
+    bool changed = false;
+
+    // Recolour: the coverage-weighted mean of the source is the least-squares
+    // optimum, so it is solved directly -- only whether it helps is tested.
+    {
+        Probe rc = probe(cur, base.mean);
+        float sc = score(rc.em, rc.area, eg);
+        if (sc < bestS) {
+            bestS = sc; bestCol = base.mean; bestEm = rc.em; changed = true;
+        }
+    }
+
+    // Amplitude decays over the iterations: explore, then settle.
+    float amp = RELAX_MOVE * exp(-0.25 * RELAX_ITER);
+    uint cands = uint(clamp(RELAX_CANDS, 1.0, 16.0));
+
+    for (uint c = 0u; c < cands; ++c) {
+        Stroke t = cur;
+        uint h = hashU(idx * 9781u ^ uint(RELAX_ITER) * 6151u ^ (c + 1u) * 2654435761u);
+        perturb(t, h, amp);
+
+        // Try the candidate with the colour so far and with its own optimum,
+        // so a move is not rejected merely because the old colour stopped
+        // suiting the pixels it now covers.
+        Probe pa = probe(t, bestCol);
+        float sa = score(pa.em, pa.area, eg);
+
+        Probe pb = probe(t, pa.mean);
+        float sb = score(pb.em, pb.area, eg);
+
+        float sBest = sa;
+        vec3  cBest = bestCol;
+        float eBest = pa.em;
+        if (sb < sa) { sBest = sb; cBest = pa.mean; eBest = pb.em; }
+
+        if (sBest < bestS) {
+            bestS = sBest; best = t; bestCol = cBest; bestEm = eBest;
+            changed = true;
+        }
+    }
+
+    // Removal is the same economics with no coverage at all: a stroke whose
+    // Em + w_area exceeds the error of the ground underneath is not worth any
+    // area. RELAX_REMOVE scales the break-even point, 1.0 being break even and
+    // higher more tolerant. Deleting sets vertexCount to 0, which stroke.vert
+    // skips; the slot stays put so pool indices remain stable.
+    if (RELAX_REMOVE > 0.0 && (bestEm + RELAX_AREA_W) > eg * RELAX_REMOVE) {
+        StrokeHeader dead = poolHeaders[idx];
+        dead.vertexCount = 0u;
+        poolHeaders[idx] = dead;
+        atomicAdd(pool.removed, 1u);
+        return;
+    }
+
+    if (changed) {
+        store(idx, best, bestCol, opacity);
+        atomicAdd(pool.accepted, 1u);
+    }
+}

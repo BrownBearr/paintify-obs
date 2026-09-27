@@ -1,0 +1,170 @@
+#version 460 core
+layout(local_size_x = 16, local_size_y = 16) in;
+
+#include "common.glsl"
+
+// Edge Tangent Flow -- Kang, Lee & Chui 2007, "Coherent Line Drawing", sec. 3.
+//
+// This is the one stage with no counterpart in worker.js. It exists because
+// the plain Sobel field and the Gaussian-smoothed structure tensor both have
+// the same two failures: the direction wobbles pixel to pixel right where the
+// structure is strongest, and in flat regions it is whatever the noise says,
+// because a Gaussian smooths *across* an edge as happily as along it.
+//
+// ETF is an edge-aware smoothing of the tangent field. Each pixel takes a
+// weighted mean of its neighbours' tangents, where the weights
+//
+//   w_s  spatial      1 inside the disc of radius r, 0 outside
+//   w_m  magnitude    (1 + tanh(eta * (g(y) - g(x)))) / 2
+//   w_d  direction    |t(x) . t(y)|
+//   phi  sign         +1 or -1, resolving the tangent's 180-degree ambiguity
+//
+// together mean: a weak pixel is pulled towards its strong neighbours (w_m),
+// never towards a neighbour whose flow is perpendicular to its own (w_d), and
+// a tangent and its negation are treated as the same direction (phi). A plain
+// Gaussian has none of those terms, which is the whole difference.
+//
+// It is a *direction* filter and nothing else. The magnitude in .z is carried
+// through untouched, and the output vector is rescaled to the input's length,
+// so every downstream consumer -- trace.comp's gradient-magnitude floor, and
+// the fc filter's weighting of `nd` against a unit `lastDir` at curvature < 1
+// -- sees exactly the quantity it saw before. That is what lets this be
+// switched on and off without changing anything else about the render.
+
+layout(binding = 0) uniform sampler2D uField;   // current iterate (gx, gy, gmag, 0)
+layout(rgba16f, binding = 0) uniform writeonly image2D uOut;
+
+// One uint holding the frame's maximum gradient magnitude, as a float's bit
+// pattern. Non-negative floats order the same as their bit patterns, so a
+// plain atomicMax over uints is a correct max over the magnitudes and needs no
+// compare-and-swap loop.
+layout(std430, binding = 10) restrict buffer EtfMaxBuf { uint gMagMax; };
+
+// Two floats per workgroup: the summed local coherence and how many pixels
+// contributed. Shares the relaxation energy buffer, which is sized for two
+// floats per group and is never in flight at the same time as this.
+layout(std430, binding = 9) restrict writeonly buffer CoherenceBuf { float coPartial[]; };
+
+uniform int uPass;   // 0 = reduce the magnitude maximum, 1 = filter,
+                     // 2 = measure flow coherence
+
+shared float sCoh[256];
+shared float sCnt[256];
+
+// Kang's eta. The paper uses 1 and does not tune it; it only sets how sharply
+// a weaker pixel defers to a stronger one, and the tanh is gentle enough that
+// the result is insensitive to it. Kept as a constant rather than a uniform so
+// the Params block does not grow a knob nobody turns.
+const float ETF_ETA = 1.0;
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = ivec2(IMG_SIZE);
+    uint lid = gl_LocalInvocationIndex;
+    bool inside = px.x < size.x && px.y < size.y;
+
+    // Pass 2 reduces across the workgroup, so every invocation has to reach the
+    // barriers -- an early return for the out-of-range tail would deadlock.
+    if (uPass == 2) {
+        float coh = 0.0, cnt = 0.0;
+        if (inside) {
+            vec4 c2 = texelFetch(uField, px, 0);
+            float l2 = length(c2.xy);
+            if (l2 >= 1e-8) {
+                vec2 t2 = vec2(-c2.y, c2.x) / l2;
+                float acc = 0.0, n = 0.0;
+                // Mean |t(x).t(y)| over the 8-neighbourhood. 1 is a perfectly
+                // aligned field, 0.64 is what a uniformly random one gives
+                // (the mean of |cos| over a half-turn is 2/pi), so the useful
+                // reading is how far above that floor the field sits. This is
+                // the number ETF is supposed to raise, and measuring it is the
+                // only way to tell a working filter from one that merely made
+                // the picture different.
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        if (dx == 0 && dy == 0) continue;
+                        vec4 o2 = texelFetch(uField, clamp(px + ivec2(dx, dy),
+                                                           ivec2(0), size - 1), 0);
+                        float ol2 = length(o2.xy);
+                        if (ol2 < 1e-8) continue;
+                        acc += abs(dot(t2, vec2(-o2.y, o2.x) / ol2));
+                        n += 1.0;
+                    }
+                }
+                if (n > 0.0) { coh = acc / n; cnt = 1.0; }
+            }
+        }
+
+        sCoh[lid] = coh;
+        sCnt[lid] = cnt;
+        barrier();
+        for (uint s = 128u; s > 0u; s >>= 1u) {
+            if (lid < s) { sCoh[lid] += sCoh[lid + s]; sCnt[lid] += sCnt[lid + s]; }
+            barrier();
+        }
+        if (lid == 0u) {
+            uint idx = gl_WorkGroupID.y * uint(gl_NumWorkGroups.x) + gl_WorkGroupID.x;
+            coPartial[idx * 2u + 0u] = sCoh[0];
+            coPartial[idx * 2u + 1u] = sCnt[0];
+        }
+        return;
+    }
+
+    if (!inside) return;
+    vec4 c = texelFetch(uField, px, 0);
+
+    if (uPass == 0) {
+        atomicMax(gMagMax, floatBitsToUint(max(c.z, 0.0)));
+        return;
+    }
+
+    int r = int(ETF_RADIUS);
+    float len = length(c.xy);
+    // A pixel with no gradient at all has no tangent to rotate into, and
+    // normalising it would invent a direction. Leave it exactly as it was;
+    // its neighbours still read it as a zero-weight contribution.
+    if (r < 1 || len < 1e-8) { imageStore(uOut, px, c); return; }
+
+    // ETF is defined on the tangent field. The texture stores a gradient,
+    // because that is what trace.comp expects and rotates for itself, so
+    // rotate in here and back out at the end -- the round trip is exact.
+    vec2 tc = vec2(-c.y, c.x) / len;
+
+    // w_m compares *normalised* magnitudes. Without the normalisation the
+    // tanh sits on raw Sobel sums, which on a 0..1 image are small enough that
+    // it never leaves its linear region and w_m collapses to a constant 0.5 --
+    // i.e. the term silently stops doing anything. Hence the reduction in
+    // pass 0.
+    float gmax = max(uintBitsToFloat(gMagMax), 1e-6);
+    float gc = c.z / gmax;
+
+    vec2 sum = vec2(0.0);
+    for (int dy = -r; dy <= r; ++dy) {
+        for (int dx = -r; dx <= r; ++dx) {
+            // w_s: Kang's neighbourhood is a disc, not the square the loop
+            // bounds describe. A square kernel would weight the diagonals
+            // further out than the axes and bias the flow towards 45 degrees.
+            if (dx * dx + dy * dy > r * r) continue;
+
+            vec4 o = texelFetch(uField, clamp(px + ivec2(dx, dy),
+                                              ivec2(0), size - 1), 0);
+            float ol = length(o.xy);
+            if (ol < 1e-8) continue;
+
+            vec2 to = vec2(-o.y, o.x) / ol;
+            float wm = 0.5 * (1.0 + tanh(ETF_ETA * (o.z / gmax - gc)));
+            float d  = dot(tc, to);
+            float wd = abs(d);
+            float phi = (d >= 0.0) ? 1.0 : -1.0;
+
+            sum += phi * to * (wm * wd);
+        }
+    }
+
+    float sl = length(sum);
+    vec2 tn = (sl > 1e-8) ? sum / sl : tc;
+
+    // Back to a gradient, at the input's length. Inverse of the rotation
+    // above: given t = (-gy, gx) / len, the gradient is (t.y, -t.x) * len.
+    imageStore(uOut, px, vec4(vec2(tn.y, -tn.x) * len, c.z, 0.0));
+}

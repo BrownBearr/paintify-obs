@@ -1,0 +1,44 @@
+#version 460 core
+layout(local_size_x = 16, local_size_y = 16) in;
+
+#include "common.glsl"
+
+// Separable Gaussian, a direct port of worker.js `gaussianBlurRGB` +
+// `makeGaussKernel`: radius = ceil(sigma * 2.5), weights normalised over that
+// finite window, clamp-to-edge at the borders. The kernel is evaluated inline
+// rather than uploaded -- 31 exp() calls per pixel is cheaper than the extra
+// binding, and it keeps sigma a plain uniform the layer loop can change.
+//
+// This is the per-layer reference image (`refBlur`), and it is the single most
+// important difference from the first version of this renderer, which sampled
+// a mip level instead. A box-filtered mip is not a Gaussian: it leaves blocky
+// low-frequency structure that the stroke colours then inherit.
+
+layout(binding = 0) uniform sampler2D uIn;
+layout(rgba16f, binding = 0) uniform writeonly image2D uOut;
+
+uniform int uPass;   // 0 = horizontal, 1 = vertical
+
+const int MAX_R = 40;
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = ivec2(IMG_SIZE);
+    if (px.x >= size.x || px.y >= size.y) return;
+
+    float sigma = max(0.1, BLUR_SIGMA);
+    int radius = min(int(ceil(sigma * 2.5)), MAX_R);
+    float inv2s2 = -0.5 / (sigma * sigma);
+    ivec2 step_ = (uPass == 0) ? ivec2(1, 0) : ivec2(0, 1);
+
+    vec3 acc = vec3(0.0);
+    float wsum = 0.0;
+    for (int d = -radius; d <= radius; ++d) {
+        float wt = exp(inv2s2 * float(d * d));
+        ivec2 q = clamp(px + step_ * d, ivec2(0), size - 1);
+        acc += wt * texelFetch(uIn, q, 0).rgb;
+        wsum += wt;
+    }
+
+    imageStore(uOut, px, vec4(acc / max(wsum, 1e-8), 1.0));
+}

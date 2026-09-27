@@ -1,0 +1,138 @@
+#version 460 core
+layout(local_size_x = 16, local_size_y = 16) in;
+
+#include "common.glsl"
+
+// Canvas setup and the temporal source-difference map -- the small writes that
+// do not deserve a stage of their own.
+//
+// Pass 0 is worker.js `applyUnderpaint` mode 'blur': the coarsest layer's
+// Gaussian reference becomes the starting canvas. The first version of this
+// renderer blitted the source at 1:1 instead (identical src/dst rects, so
+// GL_LINEAR was a straight copy), which left the sharp photograph showing
+// through every gap between strokes.
+
+layout(binding = 0) uniform sampler2D uIn;        // pass 0: blurred source
+layout(binding = 1) uniform sampler2D uSrc;       // pass 2: current source
+layout(binding = 2) uniform sampler2D uPrevSrc;   // pass 2: previous source
+// Units 3 and 4 are already spoken for pipeline-wide (the temporal difference
+// map and the brush atlas), so the flow pair continues past them rather than
+// reusing numbers that mean something else in every other stage.
+layout(binding = 5) uniform sampler2D uFlow;       // backward flow, quarter res
+layout(binding = 6) uniform sampler2D uPrevCanvas; // pass 3: last frame's paint
+layout(rgba16f, binding = 0) uniform writeonly image2D uCanvas;
+layout(r16f, binding = 1) uniform writeonly image2D uDiff;
+
+uniform int  uPass;   // 0 = copy blurred source, 1 = flat fill, 2 = source diff,
+                      // 3 = advect the previous canvas along the flow
+uniform int  uUseFlow;  // pass 2: compare against the motion-compensated frame
+uniform vec3 uFill;
+
+// Where pixel `px` of this frame was in the previous one, in uv. With no flow
+// this is just px itself, which is what makes "flow off" and "flow computed
+// but nothing moved" the same code path rather than two.
+vec2 prevUV(ivec2 px) {
+    vec2 uv = (vec2(px) + 0.5) / IMG_SIZE;
+    return uv + texture(uFlow, uv).xy / IMG_SIZE;
+}
+
+// Catmull-Rom resampling of the carried canvas.
+//
+// Bilinear is not usable here, and the reason is worth stating because it is
+// invisible in any single frame. The canvas is warped *again every frame* it
+// survives without being repainted, and bilinear interpolation is a low-pass
+// filter, so the blur compounds: measured over eleven frames of a pan with no
+// repainting, bilinear cost 89% of the image's sharpness (variance of the
+// Laplacian 652 -> 75). The painting dissolved while every frame-to-frame
+// stability number looked excellent.
+//
+// Catmull-Rom has negative lobes that restore what a resample takes out, which
+// is why temporal anti-aliasing uses it for exactly this job. It does not make
+// the warp lossless, only slow enough to lose that the ordinary repaint
+// threshold refreshes paint faster than the warp degrades it.
+float crWeight(float t, int i) {
+    float t2 = t * t, t3 = t2 * t;
+    if (i == 0) return -0.5 * t3 +       t2 - 0.5 * t;
+    if (i == 1) return  1.5 * t3 - 2.5 * t2            + 1.0;
+    if (i == 2) return -1.5 * t3 + 2.0 * t2 + 0.5 * t;
+    return              0.5 * t3 - 0.5 * t2;
+}
+
+vec3 sampleCatmullRom(sampler2D tex, vec2 uv) {
+    vec2 size = IMG_SIZE;
+    vec2 xy = uv * size - 0.5;
+    vec2 base = floor(xy);
+    vec2 f = xy - base;
+
+    vec3 acc = vec3(0.0);
+    float wsum = 0.0;
+    for (int j = 0; j < 4; ++j) {
+        float wy = crWeight(f.y, j);
+        for (int i = 0; i < 4; ++i) {
+            float w = crWeight(f.x, i) * wy;
+            ivec2 q = clamp(ivec2(base) + ivec2(i - 1, j - 1),
+                            ivec2(0), ivec2(size) - 1);
+            acc += texelFetch(tex, q, 0).rgb * w;
+            wsum += w;
+        }
+    }
+    // The weights sum to 1 analytically; normalising covers the clamped edge
+    // taps, where the same texel is counted more than once.
+    return acc / max(wsum, 1e-5);
+}
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = ivec2(IMG_SIZE);
+    if (px.x >= size.x || px.y >= size.y) return;
+
+    if (uPass == 0) {
+        imageStore(uCanvas, px, vec4(clamp(texelFetch(uIn, px, 0).rgb, 0.0, 1.0), 1.0));
+    } else if (uPass == 1) {
+        imageStore(uCanvas, px, vec4(clamp(uFill, 0.0, 1.0), 1.0));
+    } else if (uPass == 3) {
+        // Advect the previous frame's paint along the flow. This is the whole
+        // point of computing the flow: on a pan the painting then travels with
+        // the subject instead of staying pinned to the pixel grid, and the
+        // difference test below finds almost nothing left to repaint.
+        //
+        // What it does not do is re-orient a stroke to the new flow field, or
+        // move strokes as objects -- the carried state here is a canvas, not a
+        // stroke list, so this advects the image of the painting. See
+        // docs/flow.md for what that costs.
+        vec2 uvp = prevUV(px);
+
+        // A pixel that did not move must not be resampled at all. Any filter,
+        // Catmull-Rom included, loses a little each time it is applied, and
+        // over a long shot that loss is cumulative -- so on footage where the
+        // camera is still and only part of the frame moves, an unconditional
+        // warp would slowly dissolve a background that never needed touching.
+        // Snapping sub-hundredth-pixel flow to an exact texel copy makes the
+        // still parts of a shot exactly lossless, which is the case most
+        // footage spends most of its time in.
+        vec2 dpx = (uvp - (vec2(px) + 0.5) / IMG_SIZE) * IMG_SIZE;
+        if (dot(dpx, dpx) < 1e-4) {
+            imageStore(uCanvas, px, vec4(texelFetch(uPrevCanvas, px, 0).rgb, 1.0));
+            return;
+        }
+
+        // The clamp is not cosmetic: Catmull-Rom's negative lobes overshoot at
+        // a hard stroke edge, and an unclamped negative or >1 value here is
+        // carried into the next frame's warp and amplified.
+        imageStore(uCanvas, px, vec4(clamp(sampleCatmullRom(uPrevCanvas, uvp),
+                                           0.0, 1.0), 1.0));
+    } else {
+        // Mean absolute channel difference, the quantity worker.js thresholds
+        // against frameDiffThreshold (which is on a 0..255 scale, so scale up).
+        //
+        // With flow on, the comparison is motion-compensated: the question
+        // becomes "did this piece of the subject change?" rather than "did the
+        // colour at this pixel change?". Under a pure translation the first
+        // answer is no everywhere and the second is yes everywhere, which is
+        // exactly why a pan rebuilt the whole painting every frame.
+        vec3 prev = (uUseFlow != 0) ? texture(uPrevSrc, prevUV(px)).rgb
+                                    : texelFetch(uPrevSrc, px, 0).rgb;
+        vec3 d = abs(texelFetch(uSrc, px, 0).rgb - prev);
+        imageStore(uDiff, px, vec4(dot(d, vec3(1.0)) / 3.0 * 255.0, 0.0, 0.0, 0.0));
+    }
+}

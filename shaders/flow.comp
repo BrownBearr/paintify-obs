@@ -1,0 +1,158 @@
+#version 460 core
+layout(local_size_x = 16, local_size_y = 16) in;
+
+#include "common.glsl"
+
+// Dense optical flow: pyramidal Lucas-Kanade, coarse to fine.
+//
+// What it is for. Temporal mode carries the previous frame's *canvas* forward
+// and repaints only the cells whose source moved (see layUnderpaint). On a
+// static camera that is nearly perfect, because the carried paint is still in
+// the right place. On a pan it is nearly useless: every pixel's source has
+// moved, so every cell repaints, and the painting is rebuilt from scratch each
+// frame even though the picture only translated. The strokes are anchored to
+// the pixel grid rather than to the subject.
+//
+// The fix is to move the carried canvas with the content before reusing it,
+// which needs to know how the content moved. That is this stage.
+//
+// Convention: the stored vector d is a *backward* displacement, in full
+// resolution pixels, defined by
+//
+//     prev(x + d(x))  ~=  cur(x)
+//
+// so every consumer samples the previous frame at `x + d` and nothing has to
+// remember a sign. d is zero when nothing moved, which makes "flow off" and
+// "flow computed but static" the same code path.
+//
+// Resolution. The field is computed and stored at a quarter of the image size.
+// A flow field used to advect a painting only has to be smooth and roughly
+// right -- it is not being used for frame interpolation -- and quarter
+// resolution cuts the work by 16x. The consumers sample it with a normalised
+// coordinate, so the bilinear upsample is free.
+//
+// That choice also fixes where the pyramid has to stop: the LK window is
+// spaced one level-L pixel apart, and at level FLOW_LEVEL (2, i.e. the 4x
+// downsample) that spacing is exactly the flow grid's own. Going finer would
+// sample a window narrower than the gap between flow samples, which measures
+// something the field cannot represent.
+
+layout(binding = 0) uniform sampler2D uLumaPrev;  // R16F, mipped
+layout(binding = 1) uniform sampler2D uLumaCur;   // R16F, mipped
+layout(binding = 2) uniform sampler2D uFlowIn;    // RG16F, flow resolution
+layout(binding = 3) uniform sampler2D uSrcRgba;   // pass 0 input
+
+layout(rg16f, binding = 0) uniform writeonly image2D uFlowOut;
+layout(r16f,  binding = 1) uniform writeonly image2D uLumaOut;
+
+uniform int   uPass;       // 0 = luma, 1 = LK refine, 2 = smooth
+uniform int   uLevel;      // pyramid level for pass 1
+uniform ivec2 uFlowSize;
+uniform int   uWindow;     // LK window half-width, in level pixels
+
+// Below this smallest eigenvalue the 2x2 system is degenerate -- a flat patch
+// (no information at all) or a straight edge (the aperture problem: motion
+// along the edge is unobservable). Solving it anyway produces a large,
+// confident, wrong vector, which is far worse for advection than admitting
+// that this patch did not move: a wrong vector smears paint across the canvas,
+// whereas a zero leaves it where the previous frame had it and lets the
+// ordinary difference test repaint it.
+const float MIN_EIGENVALUE = 1e-5;
+
+void main() {
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    vec2 size = IMG_SIZE;
+
+    if (uPass == 0) {
+        ivec2 isize = ivec2(size);
+        if (gid.x >= isize.x || gid.y >= isize.y) return;
+        vec3 c = texelFetch(uSrcRgba, gid, 0).rgb;
+        imageStore(uLumaOut, gid, vec4(dot(c, vec3(0.299, 0.587, 0.114)), 0, 0, 0));
+        return;
+    }
+
+    if (gid.x >= uFlowSize.x || gid.y >= uFlowSize.y) return;
+
+    if (uPass == 2) {
+        // Component-wise 3x3 median. LK solves each window independently, so
+        // the raw field is speckled: a window that is weakly textured but
+        // still clears the eigenvalue test produces a confident vector that
+        // can be many times the true motion.
+        //
+        // A box filter is the wrong tool for that. Averaging does not remove
+        // an outlier, it spreads it over nine cells -- and because the next,
+        // finer level refines whatever this one produced, a smeared outlier is
+        // a bad starting point over a wider area. The median discards it
+        // outright and leaves a genuine motion boundary sharp, which is why
+        // the classic pyramidal LK implementations use one here.
+        float vx[9], vy[9];
+        int n = 0;
+        for (int j = -1; j <= 1; ++j) {
+            for (int i = -1; i <= 1; ++i) {
+                ivec2 q = clamp(gid + ivec2(i, j), ivec2(0), uFlowSize - 1);
+                vec2 v = texelFetch(uFlowIn, q, 0).xy;
+                vx[n] = v.x; vy[n] = v.y; ++n;
+            }
+        }
+        // Selection sort to the middle: nine elements, so the straightforward
+        // version is cheaper than anything cleverer.
+        for (int a = 0; a <= 4; ++a) {
+            for (int b = a + 1; b < 9; ++b) {
+                if (vx[b] < vx[a]) { float t = vx[a]; vx[a] = vx[b]; vx[b] = t; }
+                if (vy[b] < vy[a]) { float t = vy[a]; vy[a] = vy[b]; vy[b] = t; }
+            }
+        }
+        imageStore(uFlowOut, gid, vec4(vx[4], vy[4], 0.0, 0.0));
+        return;
+    }
+
+    // --- pass 1: one Lucas-Kanade refinement at level uLevel ---------------
+    vec2 xy = (vec2(gid) + 0.5) * (size / vec2(uFlowSize));
+    vec2 uv = xy / size;
+    vec2 d = texelFetch(uFlowIn, gid, 0).xy;
+
+    float s = float(1 << uLevel);   // full-res pixels per level-L pixel
+    vec2 stp = s / size;            // one level-L pixel, in uv
+    float lod = float(uLevel);
+
+    float a11 = 0.0, a12 = 0.0, a22 = 0.0, b1 = 0.0, b2 = 0.0;
+    for (int j = -uWindow; j <= uWindow; ++j) {
+        for (int i = -uWindow; i <= uWindow; ++i) {
+            vec2 uvc = uv + vec2(i, j) * stp;
+
+            // Gradients are taken on the *current* frame, not on the warped
+            // previous one. That is the usual approximation: at convergence
+            // prev(x+d) matches cur(x), so their gradients match too, and
+            // taking them here keeps them independent of d. Coarse-to-fine is
+            // what keeps d small enough for it to hold.
+            float cx = textureLod(uLumaCur, uvc, lod).r;
+            float gx = (textureLod(uLumaCur, uvc + vec2(stp.x, 0.0), lod).r
+                      - textureLod(uLumaCur, uvc - vec2(stp.x, 0.0), lod).r) * 0.5;
+            float gy = (textureLod(uLumaCur, uvc + vec2(0.0, stp.y), lod).r
+                      - textureLod(uLumaCur, uvc - vec2(0.0, stp.y), lod).r) * 0.5;
+
+            float pv = textureLod(uLumaPrev, uvc + d / size, lod).r;
+            float r = pv - cx;
+
+            a11 += gx * gx; a12 += gx * gy; a22 += gy * gy;
+            b1  += gx * r;  b2  += gy * r;
+        }
+    }
+
+    float det = a11 * a22 - a12 * a12;
+    float tr  = a11 + a22;
+    float lmin = 0.5 * (tr - sqrt(max(0.0, tr * tr - 4.0 * det)));
+
+    if (det > 1e-12 && lmin > MIN_EIGENVALUE) {
+        // delta = -A^-1 b, in level pixels.
+        vec2 dl = -vec2(a22 * b1 - a12 * b2, a11 * b2 - a12 * b1) / det;
+        // One level pixel per iteration is the standard LK leash. The
+        // linearisation is only valid for sub-pixel steps; without the clamp a
+        // single badly conditioned window throws a vector big enough to tear a
+        // hole in the warped canvas, and the smoothing pass then spreads it.
+        dl = clamp(dl, vec2(-1.0), vec2(1.0));
+        d += dl * s;
+    }
+
+    imageStore(uFlowOut, gid, vec4(d, 0.0, 0.0));
+}

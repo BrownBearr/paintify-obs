@@ -1,0 +1,37 @@
+#version 460 core
+layout(local_size_x = 16, local_size_y = 16) in;
+
+#include "common.glsl"
+
+// Port of worker.js `applyImpastoLighting` (Hertzmann 2002, "Fast Paint
+// Texture"): treat the accumulated stroke coverage as a height field, light it
+// from `lightAngle`, and multiply the canvas by the result.
+//
+// The subtlety worth preserving is that the lighting is relative to flat: a
+// pixel with no relief has normal (0,0,1) and produces light == 1, so bare
+// canvas keeps its colour instead of the whole image being multiplied down.
+
+layout(binding = 0) uniform sampler2D uHeight;
+layout(rgba16f, binding = 0) uniform image2D uCanvas;
+
+void main() {
+    ivec2 px = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = ivec2(IMG_SIZE);
+    if (px.x >= size.x || px.y >= size.y) return;
+    if (IMPASTO_LIGHT <= 0.0) return;
+
+    float ang = radians(LIGHT_ANGLE);
+    vec3 L = normalize(vec3(cos(ang), -sin(ang), 0.5));
+    const float gain = 2.5;
+
+    #define H(dx, dy) texelFetch(uHeight, clamp(px + ivec2(dx, dy), ivec2(0), size - 1), 0).r
+    float dzdx = (H(1, 0) - H(-1, 0)) * 0.5;
+    float dzdy = (H(0, 1) - H(0, -1)) * 0.5;
+    #undef H
+
+    vec3 N = normalize(vec3(-dzdx, -dzdy, 1.0));
+    float light = clamp(1.0 + IMPASTO_LIGHT * gain * (dot(N, L) - L.z), 0.35, 1.8);
+
+    vec4 c = imageLoad(uCanvas, px);
+    imageStore(uCanvas, px, vec4(min(c.rgb * light, vec3(1.0)), c.a));
+}

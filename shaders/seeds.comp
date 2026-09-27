@@ -1,0 +1,90 @@
+#version 460 core
+layout(local_size_x = 8, local_size_y = 8) in;
+
+#include "common.glsl"
+
+// One invocation per seed-grid cell, mirroring worker.js's `cells` loop.
+// A cell earns a stroke only when its mean Lab error exceeds the threshold --
+// which is the whole of Hertzmann's placement rule, and exactly what the first
+// version of this renderer replaced with an edge-magnitude blue-noise dither.
+
+layout(binding = 0) uniform sampler2D uRef;       // per-layer reference blur
+
+struct Cell { float meanErr; uint best; float maxDiff; float pad; };
+layout(std430, binding = 0) restrict readonly buffer CellBuf { Cell cells[]; };
+layout(std430, binding = 1) restrict buffer SeedBuf { Seed seeds[]; };
+layout(std430, binding = 3) restrict buffer CounterBuf {
+    uint seedCount; uint traceCount; uint drawnCount; uint pointCount;
+};
+
+uniform int uTemporal;
+
+void main() {
+    ivec2 cell = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = ivec2(IMG_SIZE);
+    int grid = max(1, int(GRID_SPACING));
+    ivec2 gridSize = (size + grid - 1) / grid;
+    if (cell.x >= gridSize.x || cell.y >= gridSize.y) return;
+
+    uint cellIdx = uint(cell.y) * uint(gridSize.x) + uint(cell.x);
+
+    // The finest layer can ask for more strokes than the stroke buffers hold,
+    // so a layer is painted in several chunks. Assigning cells to chunks by
+    // hash rather than by index keeps each chunk scattered over the whole
+    // image -- contiguous chunks would paint in bands and show their seams,
+    // since worker.js shuffles the cell list before walking it.
+    uint nChunks = uint(max(CHUNK_COUNT, 1.0));
+    if (nChunks > 1u && (hashU(cellIdx * 2654435761u) % nChunks) != uint(CHUNK)) return;
+
+    uint layer = uint(CUR_LAYER);
+    uint seedHash = hashU(cellIdx ^ (layer + 1u) * 83492791u
+                          ^ frameSalt() * 374761393u);
+
+    Cell c = cells[cellIdx];
+
+    // worker.js: `if (meanErr <= effectiveThreshold && !isFirstLayer) continue`
+    // -- the coarsest layer always paints, so the canvas starts covered.
+    if (c.meanErr <= THRESHOLD && FIRST_LAYER < 0.5) return;
+
+    ivec2 sp = ivec2(int(c.best & 0xffffu), int(c.best >> 16));
+    sp = clamp(sp, ivec2(0), size - 1);
+
+    // Temporal coherence: a cell whose source barely moved keeps last frame's
+    // paint. This is worker.js's frameDiffThreshold rule.
+    if (uTemporal != 0 && c.maxDiff < FRAME_DIFF) return;
+
+    uint budget = min(uint(SEED_BUDGET), uint(seeds.length()));
+    uint idx = atomicAdd(seedCount, 1u);
+    if (idx >= budget) return;   // counter may overshoot; readers clamp
+
+    // Per-stroke size and opacity variation. Web rounds the radius to an
+    // integer because its rasteriser walks integer pixel boxes; we keep it
+    // fractional, which only makes the size distribution smoother.
+    float radius = max(1.0, LAYER_RADIUS * (1.0 + (hash01(seedHash ^ 0x11u) * 2.0 - 1.0) * SIZE_JITTER));
+    float op = clamp(OPACITY * (1.0 + (hash01(seedHash ^ 0x22u) * 2.0 - 1.0) * OPACITY_JITTER), 0.0, 1.0);
+
+    // Stroke colour is the reference blur at the seed pixel -- a point sample
+    // of a properly Gaussian-blurred image, not a mip average.
+    vec3 col = clamp(texelFetch(uRef, sp, 0).rgb, 0.0, 1.0);
+    if (JITTER_HUE > 0.0 || JITTER_SAT > 0.0 || JITTER_VAL > 0.0) {
+        vec3 hsv = rgb2hsv(col);
+        hsv.x = fract(hsv.x + (hash01(seedHash ^ 0xa1u) * 2.0 - 1.0) * JITTER_HUE);
+        hsv.y = clamp(hsv.y + (hash01(seedHash ^ 0xb2u) * 2.0 - 1.0) * JITTER_SAT, 0.0, 1.0);
+        hsv.z = clamp(hsv.z + (hash01(seedHash ^ 0xc3u) * 2.0 - 1.0) * JITTER_VAL, 0.0, 1.0);
+        col = hsv2rgb(hsv);
+    }
+
+    // Brush tile variant, hashed from the seed position exactly as
+    // brush-texture.js `getStrokeTexture` does, so a video's strokes keep
+    // their texture from frame to frame.
+    uint variant = brushHash(sp.x, sp.y, int(layer)) & 0x7fffu;
+
+    Seed s;
+    s.pos = vec2(sp) + 0.5;
+    s.dir = vec2(0.0);          // worker.js starts with lastDx = lastDy = 0
+    s.color = packUnorm4x8(vec4(col, op));
+    s.radius = radius;
+    s.layerTex = layer | (variant << 16);
+    s.pad = 0.0;
+    seeds[idx] = s;
+}
