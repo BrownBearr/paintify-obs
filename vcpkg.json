@@ -1,0 +1,16 @@
+{
+  "name": "gpu-sbr",
+  "version": "0.1.0",
+  "builtin-baseline": "cc73782a88db48af17f8bfb8328d4cab3d4c246f",
+  "dependencies": [
+    "glfw3",
+    "glad",
+    "glm",
+    "stb",
+    { "name": "spout2", "features": ["dx"], "platform": "windows" },
+    {
+      "name": "imgui",
+      "features": ["glfw-binding", "opengl3-binding"]
+    }
+  ]
+}
